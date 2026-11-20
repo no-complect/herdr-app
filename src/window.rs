@@ -8,7 +8,6 @@ use crate::hc::Core;
 mod floats;
 mod movable;
 mod pane_drag;
-mod pane_pulse;
 mod pane_size;
 mod titlebar;
 
@@ -28,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 const HEADER_HEIGHT: f32 = 30.0;
 const HANDLE: f32 = 6.0;
@@ -391,14 +390,6 @@ struct Watched {
     programs: Option<SystemTime>,
 }
 
-struct PaneTypingPulse {
-    pane: String,
-    terminal: EntityId,
-    started: Instant,
-    sequence: u64,
-    burst: pane_pulse::Burst,
-}
-
 pub struct AppWindow {
     core: Arc<Core>,
     runtime: Option<Rc<ShellRuntime>>,
@@ -432,7 +423,6 @@ pub struct AppWindow {
     model: Model,
     /// Terminal views by block id (panes and chrome terminal blocks).
     terms: HashMap<String, Term>,
-    typing_pulse: Option<PaneTypingPulse>,
     /// Mod copies by slot (block id, `<stack>#header`, or `overlay:<id>`).
     copies: HashMap<String, Copy>,
     overlays: Vec<Overlay>,
@@ -562,7 +552,6 @@ impl AppWindow {
             float_leave: HashMap::new(),
             model: Model::default(),
             terms: HashMap::new(),
-            typing_pulse: None,
             copies: HashMap::new(),
             overlays: Vec::new(),
             toast_scroll: ScrollHandle::new(),
@@ -1598,7 +1587,7 @@ impl AppWindow {
             self.tell_term(&view, &address, cx);
             mods::track_pane_view(id.clone(), &view);
             let (block, addr) = (id.clone(), address.clone());
-            let sub = cx.subscribe_in(&view, window, move |this, terminal, ev: &TerminalEvent, window, cx| match ev {
+            let sub = cx.subscribe_in(&view, window, move |this, _, ev: &TerminalEvent, window, cx| match ev {
                 TerminalEvent::Peek(address) => this.peek_terminal(address, window, cx),
                 TerminalEvent::Link(click) => this.handle_link(&block, &addr, click, window, cx),
                 TerminalEvent::TitleChanged => this.publish(cx),
@@ -1607,9 +1596,6 @@ impl AppWindow {
                     this.refresh_snapshot_mods(cx);
                 }
                 TerminalEvent::SelectionChanged => this.publish_selection(&addr, window, cx),
-                TerminalEvent::Typed => {
-                    this.pulse_typed_pane(block.trim_end_matches(SWAP), terminal.entity_id(), window, cx);
-                }
                 TerminalEvent::Ended => this.terminal_ended(&block, window, cx),
                 TerminalEvent::ContextMenu(at) => {
                     this.open_menu("pane", json!({ "pane": block.trim_end_matches(SWAP), "terminal": addr }), Some(*at), window, cx)
@@ -4587,88 +4573,6 @@ impl AppWindow {
         (frame.lone || ctx.root.panes().len() > 1).then_some(frame)
     }
 
-    fn pane_has_typing_focus(&self, pane: &str, terminal: EntityId, window: &Window) -> bool {
-        // A pane can show a different terminal or lose the keyboard while an event is queued.
-        window.is_window_active()
-            && self.focused_pane.as_deref() == Some(pane)
-            && self.pane_term(pane).is_some_and(|term| {
-                term.view.entity_id() == terminal && term.focus.is_focused(window)
-            })
-    }
-
-    fn pulse_typed_pane(
-        &mut self,
-        pane: &str,
-        terminal: EntityId,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.pane_has_typing_focus(pane, terminal, window) {
-            return;
-        }
-
-        let now = cx.background_executor().now();
-        let previous = self.typing_pulse.as_ref();
-        if previous.is_some_and(|pulse| {
-            pulse.terminal == terminal && now.duration_since(pulse.started) < pane_pulse::DURATION
-        }) {
-            return;
-        }
-
-        if !self.pane_frame().is_some_and(|frame| {
-            frame.typing_pulse && pane_size::frame_border(frame, true).is_some_and(|line| line.width > 0.0)
-        }) || !self.model.active_tab().is_some_and(|tab| tab.shown().find(pane).is_some())
-        {
-            return;
-        }
-
-        let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
-        self.typing_pulse = Some(PaneTypingPulse {
-            pane: pane.to_owned(),
-            terminal,
-            started: now,
-            sequence: previous.map_or(0, |p| p.sequence.wrapping_add(1)),
-            burst: pane_pulse::Burst::new(seed, previous.map(|p| p.burst.color)),
-        });
-        cx.notify();
-    }
-
-    fn animate_typing_frame(frame: Div, pulse: &PaneTypingPulse, color: Hsla, radius: Pixels) -> AnyElement {
-        let burst = pulse.burst;
-        let tint = c(pane_pulse::COLORS[burst.color]);
-        let light = tint.blend(rgb(0xf6f8ff).alpha(0.82).into());
-        let layers = [(14.0, 0.08), (9.0, 0.16), (5.0, 0.28), (2.0, 0.47)]
-            .map(|(width, opacity)| (settings::z(width), opacity));
-
-        frame.with_animation(
-            ("pane-typing", pulse.sequence),
-            Animation::new(pane_pulse::DURATION),
-            move |frame, progress| {
-                let strength = burst.intensity(progress * pane_pulse::DURATION.as_millis() as f32);
-                if strength == 0.0 {
-                    return frame;
-                }
-
-                frame.border_color(color.blend(light.alpha(strength))).child(
-                    canvas(|_, _, _| (), move |bounds, _, window, _| {
-                        // The inset glow paints over the pane without taking space or input.
-                        for (width, opacity) in layers {
-                            let width = width.min(bounds.size.width.min(bounds.size.height) / 2.);
-                            window.paint_quad(quad(
-                                bounds,
-                                Corners::all(radius),
-                                Hsla::transparent_black(),
-                                Edges::all(width),
-                                tint.alpha(opacity * strength),
-                                BorderStyle::Solid,
-                            ));
-                        }
-                    }).absolute().inset_0(),
-                )
-            },
-        ).into_any_element()
-    }
-
     /// A pane in its frame: the look, and the header mod above or below it
     /// (on hover: drawn over the terminal, so it never resizes).
     fn frame_pane(&self, n: &Node, f: &PaneFrame, on: bool, inner: AnyElement, cx: &mut Context<Self>) -> AnyElement {
@@ -4686,32 +4590,15 @@ impl AppWindow {
         }
         el = shadow(el, f.shadow.as_deref());
         let body = div().flex_1().min_h_0().flex().child(inner);
-        let el = if let Some(h) = &f.header {
-            let head = div().flex_none().h(settings::z(pane_size::header_height(h))).w_full().flex()
-                .child(self.render_slot(&format!("{}#frame", n.id), cx));
-            if h.hover() {
-                let head = head.absolute().left_0().right_0().opacity(0.).group_hover(group, |s| s.opacity(1.));
-                let head = if h.bottom() { head.bottom_0() } else { head.top_0() };
-                el.child(body).child(head)
-            } else if h.bottom() {
-                el.child(body).child(head)
-            } else {
-                el.child(head).child(body)
-            }
-        } else {
-            el.child(body)
-        };
-
-        if on && f.typing_pulse
-            && let Some(line) = line
-            && let Some(pulse) = self.typing_pulse.as_ref()
-            && pulse.pane == n.id
-            && cx.background_executor().now().duration_since(pulse.started) < pane_pulse::DURATION
-            && self.pane_term(&n.id).is_some_and(|term| term.view.entity_id() == pulse.terminal)
-        {
-            return Self::animate_typing_frame(el, pulse, c(&line.color), settings::z(f.radius.unwrap_or_default()));
+        let Some(h) = &f.header else { return el.child(body).into_any_element() };
+        let head = div().flex_none().h(settings::z(pane_size::header_height(h))).w_full().flex()
+            .child(self.render_slot(&format!("{}#frame", n.id), cx));
+        if h.hover() {
+            let head = head.absolute().left_0().right_0().opacity(0.).group_hover(group, |s| s.opacity(1.));
+            let head = if h.bottom() { head.bottom_0() } else { head.top_0() };
+            return el.child(body).child(head).into_any_element();
         }
-        el.into_any_element()
+        if h.bottom() { el.child(body).child(head) } else { el.child(head).child(body) }.into_any_element()
     }
 
     /// `frame`: how panes are wrapped here (inside a framed tab), else None.
@@ -5708,11 +5595,6 @@ impl Render for AppWindow {
             self.refresh_snapshot_mods(cx);
         }
         let focused = self.focused_path(window, cx);
-        if self.typing_pulse.as_ref().is_some_and(|pulse| {
-            !focused.contains(&pulse.pane) || !self.pane_has_typing_focus(&pulse.pane, pulse.terminal, window)
-        }) {
-            self.typing_pulse = None;
-        }
         let tree = self.render_node(&self.chrome, &focused, None, cx);
         let tree = self.window_frame(tree, window, cx);
         let overlays = self.render_overlays(window.viewport_size(), cx);
@@ -7279,158 +7161,6 @@ mod tests {
         cx.update(|window, cx| view.update(cx, |this, cx| {
             assert!(this.focused_path(window, cx).contains("pane"));
         }));
-    }
-
-    #[test]
-    fn pane_typing_pulse_follows_active_framed_terminal() {
-        in_own_process("typing_pulse_focus");
-    }
-
-    #[gpui::test]
-    fn typing_pulse_focus(cx: &mut gpui::TestAppContext) {
-        use serde_json::json;
-
-        fn frame(window: &mut super::AppWindow) -> &mut super::PaneFrame {
-            let super::Kind::Block { content: super::Content::Context { pane: Some(frame), .. } } =
-                &mut window.chrome.kind else { panic!("the test layout must frame panes") };
-            frame
-        }
-
-        if !running_alone("typing_pulse_focus") {
-            return;
-        }
-        let (view, cx) = open_window(cx, "unused", "", json!({
-            "id": "tab", "type": "block",
-            "content": { "tab": "active", "pane": { "lone": true, "focus": { "width": 2, "color": "accent" } } }
-        }));
-        cx.update(|window, _| window.activate_window());
-        cx.run_until_parked();
-
-        cx.update(|window, cx| view.update(cx, |this, cx| {
-            this.model.add_space("sp1", "", "/tmp", crate::model::Tab::new("tb1", "", "p1", "t1"));
-            this.sync(window, cx);
-            let terminal = this.pane_term("p1").unwrap().view.entity_id();
-
-            this.pulse_typed_pane("p1", terminal, window, cx);
-            assert!(this.typing_pulse.is_none(), "the layout must opt in");
-
-            frame(this).typing_pulse = true;
-            frame(this).lone = false;
-            this.pulse_typed_pane("p1", terminal, window, cx);
-            assert!(this.typing_pulse.is_none(), "an unframed single pane cannot pulse");
-
-            frame(this).lone = true;
-            frame(this).focus.as_mut().unwrap().width = 0.0;
-            this.pulse_typed_pane("p1", terminal, window, cx);
-            assert!(this.typing_pulse.is_none(), "a zero-width border cannot pulse");
-
-            frame(this).focus.as_mut().unwrap().width = 2.0;
-            this.pulse_typed_pane("offscreen", terminal, window, cx);
-            assert!(this.typing_pulse.is_none(), "only a focused pane can pulse");
-
-            let replaced_terminal = cx.new(|_| ()).entity_id();
-            this.pulse_typed_pane("p1", replaced_terminal, window, cx);
-            assert!(this.typing_pulse.is_none(), "a replaced terminal cannot pulse a reused pane");
-
-            this.pulse_typed_pane("p1", terminal, window, cx);
-            let pulse = this.typing_pulse.as_ref().unwrap();
-            assert_eq!(pulse.pane, "p1");
-            let started = pulse.started;
-            this.pulse_typed_pane("p1", terminal, window, cx);
-            assert_eq!(this.typing_pulse.as_ref().unwrap().started, started);
-        }));
-        cx.deactivate_window();
-        cx.run_until_parked();
-        cx.update(|window, cx| view.update(cx, |this, cx| {
-            this.typing_pulse = None;
-            let terminal = this.pane_term("p1").unwrap().view.entity_id();
-            this.pulse_typed_pane("p1", terminal, window, cx);
-            assert!(this.typing_pulse.is_none(), "an inactive window cannot start a pulse");
-        }));
-    }
-
-    #[test]
-    fn pane_typing_pulse_routes_events_and_restarts_at_expiry() {
-        in_own_process("typing_pulse_lifecycle");
-    }
-
-    #[gpui::test]
-    fn typing_pulse_lifecycle(cx: &mut gpui::TestAppContext) {
-        use crate::terminal::TerminalEvent;
-        use serde_json::json;
-        use std::time::Duration;
-
-        if !running_alone("typing_pulse_lifecycle") {
-            return;
-        }
-        let (view, cx) = open_window(cx, "unused", "", json!({
-            "id": "tab", "type": "block",
-            "content": { "tab": "active", "pane": { "typing_pulse": true, "focus": { "width": 2, "color": "accent" } } }
-        }));
-        cx.update(|window, _| window.activate_window());
-        cx.run_until_parked();
-        let (first, second) = cx.update(|window, cx| view.update(cx, |this, cx| {
-            this.model.add_space("sp1", "", "/tmp", crate::model::Tab::new("tb1", "", "p1", "t1"));
-            assert!(this.model.split("p1", super::Axis::Row, "p2", "t2"));
-            this.model.focus_pane("p1");
-            this.sync(window, cx);
-            (this.pane_term("p1").unwrap().view.clone(), this.pane_term("p2").unwrap().view.clone())
-        }));
-        cx.run_until_parked();
-
-        let pulse = |cx: &mut gpui::VisualTestContext| view.read_with(cx, |this, _| {
-            this.typing_pulse.as_ref().map(|pulse| (pulse.terminal, pulse.started, pulse.sequence, pulse.burst.color))
-        });
-
-        second.update(cx, |_, cx| cx.emit(TerminalEvent::Typed));
-        assert!(pulse(cx).is_none(), "background input cannot start a pulse");
-
-        first.update(cx, |_, cx| cx.emit(TerminalEvent::Typed));
-        let initial = pulse(cx).unwrap();
-        assert_eq!(initial.0, first.entity_id());
-
-        let tick = Duration::from_millis(1);
-        cx.executor().advance_clock(super::pane_pulse::DURATION - tick);
-        first.update(cx, |_, cx| cx.emit(TerminalEvent::Typed));
-        assert_eq!(pulse(cx), Some(initial), "repeat input must keep the active burst");
-
-        cx.executor().advance_clock(tick);
-        first.update(cx, |_, cx| cx.emit(TerminalEvent::Typed));
-        let next = pulse(cx).unwrap();
-        assert_eq!(next.1.duration_since(initial.1), super::pane_pulse::DURATION);
-        assert_eq!(next.2, initial.2 + 1);
-        assert_ne!(next.3, initial.3);
-
-        cx.update(|window, cx| view.update(cx, |this, cx| {
-            this.model.focus_pane("p2");
-            this.sync(window, cx);
-        }));
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(pulse(cx).is_none(), "switching panes clears the old burst");
-
-        first.update(cx, |_, cx| cx.emit(TerminalEvent::Typed));
-        assert!(pulse(cx).is_none(), "late input from the old pane is ignored");
-        second.update(cx, |_, cx| cx.emit(TerminalEvent::Typed));
-        assert_eq!(pulse(cx).unwrap().0, second.entity_id());
-
-        cx.update(|window, cx| second.update(cx, |terminal, cx| terminal.open_search(window, cx)));
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(pulse(cx).is_none(), "opening Find clears the burst");
-        second.update(cx, |_, cx| cx.emit(TerminalEvent::Typed));
-        assert!(pulse(cx).is_none(), "a late event cannot pulse while Find owns the keyboard");
-
-        cx.update(|window, cx| {
-            let focus = second.read(cx).focus_handle().clone();
-            focus.focus(window, cx);
-        });
-        second.update(cx, |_, cx| cx.emit(TerminalEvent::Typed));
-        assert_eq!(pulse(cx).unwrap().0, second.entity_id());
-
-        cx.deactivate_window();
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(pulse(cx).is_none(), "the glow clears when the window loses focus");
-        second.update(cx, |_, cx| cx.emit(TerminalEvent::Typed));
-        assert!(pulse(cx).is_none(), "an inactive window ignores incoming typing events");
     }
 
     #[test]
