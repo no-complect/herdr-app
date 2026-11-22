@@ -2,6 +2,14 @@
 
 Herdr is a desktop app for terminals and coding agents. Keep work in spaces, see which agents need you, and leave terminals running when you close the window.
 
+## Live typing-feedback test
+
+[Watch the live-window test](docs/typing-pulse-live.mp4?raw=true)
+
+The same command runs with the observer off and on. Only the opted-in, focused pane pulses. Opening Find clears an active pulse and sends the next key to the search field.
+
+This recording uses a native macOS Herdr window, a local Herdr Core, and two zsh panes. A temporary test hook dispatches keys directly to the window. [Draft PR #1348](https://github.com/herdrdev/herdr-app/pull/1348)
+
 ## Install
 
 ### Linux and macOS
